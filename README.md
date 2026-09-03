@@ -83,6 +83,11 @@ MIUI 的 `mi_thermald` 进程通过 inotify 监控 `/sys/devices/virtual/thermal
 - 修复 `onStartCommand` 中 cgroup 迁移线程与 `onDestroy` 的竞态：迁移完成后若服务已被关闭，会回滚迁移并 return，不再对已停止的服务执行后续操作
 - `startGuard` 开头增加 `running` 检查，避免在服务已停止后仍启动 inotifyd 守卫
 
+### v1.1.7 — 守卫状态一致性修复
+- **startGuardService 返回 boolean**：服务启动失败时不设 `guardEnabled=true`，避免「sconfig=9 + guardEnabled=true + 服务未运行」的假状态
+- **onDestroy 清除 guardEnabled**：Service 非正常停止时也清除全局开关，防止 `guardEnabled` 残留为 true
+- **Toast 状态准确化**：根据 `boosted && guardEnabled` 组合显示三种提示（加速+守卫运行 / ARVR但守卫未运行 / 已恢复默认），修复关闭时 root 写 0 失败仍提示「场景被改走将自动拉回」的问题
+
 ## 构建
 
 需要 Android SDK build-tools 34 + JDK 17：
