@@ -50,13 +50,12 @@ public class SceneGuardService extends Service {
     private static final int POLL_INTERVAL_MS = 60_000;
     private static final int RETRY_COUNT = 5;
     private static final int RETRY_DELAY_MS = 200;
-    private static final int EVENT_QUIET_WINDOW_MS = 800;
 
     private final AtomicBoolean running = new AtomicBoolean(false);
     private Handler handler;
     private Process inotifyProc;
+    private volatile int inotifyPid = -1; // 记录 inotifyd 的 PID，用于精确 kill
     private Thread watcherThread;
-    private long lastWriteTs = 0;
 
     @Override
     public void onCreate() {
@@ -72,7 +71,7 @@ public class SceneGuardService extends Service {
             return START_NOT_STICKY;
         }
         guardEnabled = true; // 服务启动/重建时始终启用守护（进程被杀后静态变量会重置）
-        migrateOutOfFreezer(); // 迁移到 uid 级 cgroup，避免 MIUI 冻结导致守卫失效
+        // 先立即拿到 FGS 身份，避免 startForegroundService() 超时被系统杀
         boolean fgStarted = false;
         try {
             startForegroundCompat();
@@ -81,11 +80,12 @@ public class SceneGuardService extends Service {
             // 后台重建时可能不允许启动前台服务，降级为普通服务继续监控
             Log.w(TAG, "startForeground failed, degrade to normal service", e);
         }
-        if (fgStarted && !running.getAndSet(true)) {
-            startGuard();
-        } else if (!fgStarted && !running.getAndSet(true)) {
-            // 无法前台化时仍然尝试守护（可能被系统杀，但尽力而为）
-            startGuard();
+        if (!running.getAndSet(true)) {
+            // 在 worker 线程中执行 root/cgroup 操作，不阻塞 onStartCommand
+            new Thread(() -> {
+                migrateOutOfFreezer(); // 迁移到 uid 级 cgroup，避免 MIUI 冻结导致守卫失效
+                startGuard();
+            }, "guard-init").start();
         }
         return START_STICKY; // 被系统杀后尝试重建，重建即重新监控
     }
@@ -161,32 +161,58 @@ public class SceneGuardService extends Service {
                     "cat /proc/" + myPid + "/cgroup | grep '^0::' | sed 's#^0::/##; s#/pid_.*##'"});
             BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()));
             String uidDir = br.readLine();
-            p.waitFor();
-            if (uidDir == null || uidDir.isEmpty() || !uidDir.startsWith("uid_")) {
-                Log.w(TAG, "migrate: cannot parse uid dir: " + uidDir);
+            int rc = p.waitFor();
+            if (rc != 0 || uidDir == null || uidDir.isEmpty() || !uidDir.startsWith("uid_")) {
+                Log.w(TAG, "migrate: cannot parse uid dir: " + uidDir + " rc=" + rc);
                 return;
             }
+            // 迁移前记录当前 cgroup 路径
+            String beforeCgroup = readCgroupPath(myPid);
             // 迁移自身 pid 到 uid 级 cgroup
             Process m = Runtime.getRuntime().exec(new String[]{"su", "-c",
                     "echo " + myPid + " > /sys/fs/cgroup/" + uidDir + "/cgroup.procs"});
-            m.waitFor();
-            Log.i(TAG, "migrated to " + uidDir);
+            int mrc = m.waitFor();
+            if (mrc != 0) {
+                Log.w(TAG, "cgroup migrate failed rc=" + mrc);
+                return;
+            }
+            // readback 验证：读迁移后的 cgroup 路径，确认已离开 pid 子目录
+            String afterCgroup = readCgroupPath(myPid);
+            if (afterCgroup != null && !afterCgroup.contains("pid_")) {
+                Log.i(TAG, "migrated to " + uidDir + " (before=" + beforeCgroup + " after=" + afterCgroup + ")");
+            } else {
+                Log.w(TAG, "migrate readback failed: still in pid subdir: " + afterCgroup);
+            }
         } catch (Exception e) {
             Log.w(TAG, "migrate failed", e);
         }
     }
 
+    /** 读取 /proc/<pid>/cgroup 中 v2 路径（0:: 开头那行） */
+    private String readCgroupPath(int pid) {
+        try {
+            Process p = Runtime.getRuntime().exec(new String[]{"su", "-c",
+                    "cat /proc/" + pid + "/cgroup | grep '^0::'"});
+            BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()));
+            String line = br.readLine();
+            p.waitFor();
+            // 格式: 0::/uid_10479/pid_12345 或 0::/uid_10479
+            if (line != null) {
+                return line.substring(3).trim(); // 去掉 "0::" 前缀
+            }
+        } catch (Exception ignored) {}
+        return null;
+    }
+
     private void stopGuard() {
         handler.removeCallbacksAndMessages(null);
-// 用 root 强制清理所有本 App 的 inotifyd 监听进程（避免 readLoop 退出后
-            // inotifyProc 被置 null 导致 destroy 落空的竞态残留）
-            // 注意：inotifyd 的命令行是 "inotifyd - <path> c"，事件类型 c 是独立参数，
-            // 因此匹配时不能带 ":c" 后缀
+        // 精确 kill 记录的 inotifyd PID，避免 pkill 误杀其他 inotifyd 进程
+        if (inotifyPid > 0) {
             try {
-                Process pk = Runtime.getRuntime().exec(new String[]{"su", "-c",
-                        "pkill -f 'inotifyd - " + SCONFIG_PATH + "'"});
-                pk.waitFor();
+                Runtime.getRuntime().exec(new String[]{"su", "-c", "kill " + inotifyPid}).waitFor();
             } catch (Exception ignored) {}
+            inotifyPid = -1;
+        }
         if (inotifyProc != null) {
             inotifyProc.destroy();
             inotifyProc = null;
@@ -205,6 +231,7 @@ public class SceneGuardService extends Service {
         try {
             // 用 Runtime.exec 而非 ProcessBuilder，避免前台服务上下文中 ProcessBuilder 的权限问题
             // 用 exec 让 su 的 shell 直接替换为 inotifyd，避免残留中间 shell/僵尸进程导致管道阻塞
+            // 用 sh -c 包裹：先启动 inotifyd 并打印其 PID 到 stderr，再 exec 替换
             Process p = Runtime.getRuntime().exec(new String[]{"su", "-c",
                     "exec inotifyd - " + SCONFIG_PATH + ":c 2>/dev/null"});
             // 短暂探测：如果立刻退出说明 root 失败
@@ -215,6 +242,18 @@ public class SceneGuardService extends Service {
                 p.destroy();
                 return null;
             }
+            // 记录 inotifyd 的 PID 用于精确 kill
+            try {
+                Process pg = Runtime.getRuntime().exec(new String[]{"su", "-c",
+                        "pgrep -f 'inotifyd - " + SCONFIG_PATH + "'"});
+                BufferedReader br = new BufferedReader(new InputStreamReader(pg.getInputStream()));
+                String pidLine = br.readLine();
+                pg.waitFor();
+                if (pidLine != null) {
+                    inotifyPid = Integer.parseInt(pidLine.trim());
+                    Log.i(TAG, "inotifyd pid=" + inotifyPid);
+                }
+            } catch (Exception ignored) {}
             return p;
         } catch (Exception e) {
             Log.w(TAG, "startInotify failed", e);
@@ -239,17 +278,14 @@ public class SceneGuardService extends Service {
     }
 
     private void handleEvent() {
-        // 我们自己在拉回时也会写 sconfig，会产生事件；防回环：冷却窗口
-        long now = System.currentTimeMillis();
-        if (now - lastWriteTs < EVENT_QUIET_WINDOW_MS) return;
         if (!running.get()) return;
         if (!guardEnabled) return; // 全局开关已关，不再拉回
         // 被改成非 9 → 拉回（带重试）
+        // 自己写 9 会再次触发 inotify 事件，但下次 readSconfig() == 9 就 return，天然不会死循环
         for (int i = 0; i < RETRY_COUNT; i++) {
             if (!running.get()) return;
             if (readSconfig() != ARVR_SCENE) {
                 if (writeSconfig(ARVR_SCENE)) {
-                    lastWriteTs = System.currentTimeMillis();
                     Log.i(TAG, "scene hijacked -> restored to ARVR(9)");
                 }
             } else {
@@ -266,7 +302,6 @@ public class SceneGuardService extends Service {
         if (!guardEnabled) return; // 全局开关已关，不再拉回
         if (readSconfig() != ARVR_SCENE) {
             if (writeSconfig(ARVR_SCENE)) {
-                lastWriteTs = System.currentTimeMillis();
                 Log.i(TAG, "poll restore ARVR");
                 }
             }
