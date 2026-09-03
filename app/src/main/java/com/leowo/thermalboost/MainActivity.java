@@ -48,12 +48,14 @@ public class MainActivity extends Activity {
 
     private void toggle() {
         if (boosted) {
-            // 关闭加速：先停服务（停止守护），再恢复 Normal
+            // 关闭加速：先禁用守护（防止 inotify 拉回），再停服务，再恢复 Normal
+            SceneGuardService.guardEnabled = false;
             stopGuardService();
             execRoot("echo " + NORMAL_SCENE + " > " + SCONFIG_PATH);
         } else {
-            // 开启加速：先写 ARVR，再启动守护服务
+            // 开启加速：先写 ARVR，再启用守护并启动服务
             execRoot("echo " + ARVR_SCENE + " > " + SCONFIG_PATH);
+            SceneGuardService.guardEnabled = true;
             startGuardService();
         }
         try { Thread.sleep(300); } catch (InterruptedException e) {}

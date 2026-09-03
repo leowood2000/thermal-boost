@@ -41,6 +41,12 @@ public class SceneGuardService extends Service {
 
     public static final String SCONFIG_PATH = "/sys/devices/virtual/thermal/thermal_message/sconfig";
     public static final int ARVR_SCENE = 9;
+
+    /**
+     * 全局守护开关。MainActivity 关闭加速时先置 false，
+     * 确保 stopService 的异步 onDestroy 执行前，守卫线程不会把 sconfig 拉回。
+     */
+    public static volatile boolean guardEnabled = false;
     private static final int POLL_INTERVAL_MS = 60_000;
     private static final int RETRY_COUNT = 5;
     private static final int RETRY_DELAY_MS = 200;
@@ -195,6 +201,7 @@ public class SceneGuardService extends Service {
         long now = System.currentTimeMillis();
         if (now - lastWriteTs < EVENT_QUIET_WINDOW_MS) return;
         if (!running.get()) return;
+        if (!guardEnabled) return; // 全局开关已关，不再拉回
         // 被改成非 9 → 拉回（带重试）
         for (int i = 0; i < RETRY_COUNT; i++) {
             if (!running.get()) return;
@@ -213,11 +220,12 @@ public class SceneGuardService extends Service {
     private final Runnable pollTask = new Runnable() {
         @Override
         public void run() {
-            if (!running.get()) return;
-            if (readSconfig() != ARVR_SCENE) {
-                if (writeSconfig(ARVR_SCENE)) {
-                    lastWriteTs = System.currentTimeMillis();
-                    Log.i(TAG, "poll restore ARVR");
+        if (!running.get()) return;
+        if (!guardEnabled) return; // 全局开关已关，不再拉回
+        if (readSconfig() != ARVR_SCENE) {
+            if (writeSconfig(ARVR_SCENE)) {
+                lastWriteTs = System.currentTimeMillis();
+                Log.i(TAG, "poll restore ARVR");
                 }
             }
             handler.postDelayed(this, POLL_INTERVAL_MS);
