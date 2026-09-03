@@ -99,6 +99,7 @@ public class SceneGuardService extends Service {
     @Override
     public void onDestroy() {
         running.set(false);
+        guardEnabled = false; // 确保非正常停止时也清除全局开关
         stopGuard();
         migrateBackToFreezer(); // 恢复到原来的 pid 级 cgroup，让 MIUI freezer 重新管控
         super.onDestroy();

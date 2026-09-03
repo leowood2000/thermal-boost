@@ -70,10 +70,18 @@ public class MainActivity extends Activity {
                 stopGuardService();
                 execRoot("echo " + NORMAL_SCENE + " > " + SCONFIG_PATH);
             } else {
-                // 开启加速：先写 ARVR，写成功才启用守护并启动服务
+                // 开启加速：先写 ARVR，写成功才启动守护服务
                 if (execRoot("echo " + ARVR_SCENE + " > " + SCONFIG_PATH)) {
-                    SceneGuardService.guardEnabled = true;
-                    startGuardService();
+                    if (startGuardService()) {
+                        SceneGuardService.guardEnabled = true;
+                    } else {
+                        // 服务启动失败，sconfig 已是 9 但没有守卫
+                        uiHandler.post(() -> {
+                            Toast.makeText(MainActivity.this, "加速已开启但守护服务启动失败", Toast.LENGTH_LONG).show();
+                            findViewById(R.id.toggleBtn).setEnabled(true);
+                        });
+                        return;
+                    }
                 } else {
                     // root 写入失败，不启用守护
                     uiHandler.post(() -> {
@@ -89,14 +97,19 @@ public class MainActivity extends Activity {
                 boosted = isBoosted;
                 updateUI();
                 findViewById(R.id.toggleBtn).setEnabled(true);
-                Toast.makeText(MainActivity.this,
-                    boosted ? "已开启加速充电 (ARVR)，场景被改走将自动拉回" : "已恢复默认充电",
-                    Toast.LENGTH_SHORT).show();
+                // 根据 boost + guardEnabled 组合显示准确提示
+                if (boosted && SceneGuardService.guardEnabled) {
+                    Toast.makeText(MainActivity.this, "已开启加速充电 (ARVR)，场景被改走将自动拉回", Toast.LENGTH_SHORT).show();
+                } else if (boosted && !SceneGuardService.guardEnabled) {
+                    Toast.makeText(MainActivity.this, "当前仍为 ARVR，但守卫未运行", Toast.LENGTH_SHORT).show();
+                } else {
+                    Toast.makeText(MainActivity.this, "已恢复默认充电", Toast.LENGTH_SHORT).show();
+                }
             });
         });
     }
 
-    private void startGuardService() {
+    private boolean startGuardService() {
         try {
             Intent i = new Intent(this, SceneGuardService.class);
             i.setAction(SceneGuardService.ACTION_START);
@@ -105,8 +118,10 @@ public class MainActivity extends Activity {
             } else {
                 startService(i);
             }
+            return true;
         } catch (Exception e) {
             uiHandler.post(() -> Toast.makeText(this, "守护服务启动失败: " + e.getMessage(), Toast.LENGTH_LONG).show());
+            return false;
         }
     }
 
