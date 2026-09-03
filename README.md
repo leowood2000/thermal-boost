@@ -73,6 +73,12 @@ MIUI 的 `mi_thermald` 进程通过 inotify 监控 `/sys/devices/virtual/thermal
 - **UI 状态分离**：区分「场景 = ARVR」和「守卫运行中」，新增 guardText 显示守卫状态
 - **PID 精确 kill**：`startInotify` 时用 `pgrep` 记录 inotifyd PID，`stopGuard` 时 `kill PID` 而非 `pkill` 模糊匹配
 
+### v1.1.5 — 完整性修复
+- **关闭时恢复 cgroup**：保存迁移前原始 cgroup 路径，`onDestroy` 时 `migrateBackToFreezer()` 迁回 pid 子目录，恢复 MIUI freezer 管控；原目录不存在时安全跳过
+- **生命周期竞态**：`onDestroy` 先 `removeCallbacksAndMessages` 再 `shutdownNow`；`updateUI` 提交任务前检查 `isShutdown`，post 前检查 `isFinishing`
+- **初始状态竞态**：`onCreate` 先禁用按钮，异步读取完成后才启用，防止读到错误初始状态误触 toggle
+- **root 写入失败检查**：`execRoot` 返回 `boolean`，开启时 root 失败不启动守护服务并提示用户
+
 ## 构建
 
 需要 Android SDK build-tools 34 + JDK 17：
