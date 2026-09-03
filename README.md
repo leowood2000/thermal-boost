@@ -42,11 +42,28 @@ MIUI 的 `mi_thermald` 进程通过 inotify 监控 `/sys/devices/virtual/thermal
 ## v1.1 改进
 
 - **场景守卫前台服务**：开启加速后，通过 root inotifyd 事件驱动监控 sconfig，场景被改走时自动拉回 ARVR(9)
-- **防冻结豁免**：自动把进程迁移到 uid 级 cgroup，规避 MIUI/HyperOS 后台进程冻结（freezer）导致守卫失效的问题
 - **省电设计**：inotify 事件驱动，无事件时 CPU 占用 0%；60s 低频轮询兜底
-- **进程健壮性**：exec 消除中间 shell 避免僵尸进程；关闭时 pkill 清理残留 inotifyd
 - **前台通知**：低优先级常驻通知，仅提示运行状态，无声音无振动
-- 同时对有线充电热控限流也有改善（ARVR 高温段限流比 Normal 更宽松）
+- 对有线充电热控限流也有改善（ARVR 高温段限流比 Normal 更宽松）
+
+## v1.1 修复记录
+
+### v1.1.1 — 关闭时竞态拉回
+- 修复关闭加速时 inotify 守卫线程把 sconfig 拉回 9 的问题
+- 根因：`stopService()` 异步执行，关闭时写 sconfig=0 触发 inotify 事件，守卫线程在服务停止前抢先拉回
+- 修复：增加 `guardEnabled` 静态标志位，关闭时先禁用守护再写 sconfig
+
+### v1.1.2 — 进程健壮性
+- 修复 inotifyd 孙进程残留 + 僵尸 sh 持有管道写端导致守卫静默失效的问题
+- 修复：`startInotify` 改用 `exec inotifyd`（su 的 shell 直接替换为 inotifyd，消除中间 sh 层）
+- 修复：关闭时 `pkill -f 'inotifyd - <path>'` 强制清理残留进程
+- 修复：`onStartCommand` 中置 `guardEnabled=true`，解决进程被杀后以 `START_STICKY` 重建时守卫不启动的问题
+
+### v1.1.3 — 规避 MIUI 进程冻结
+- 修复 App 退后台后 MIUI/HyperOS 通过 cgroup freezer 冻结进程导致守卫失效的问题
+- 根因：MIUI 的 PowerKeeper/智能省电把 App 进程冻结到 `do_freezer_trap`，inotifyd 虽不受影响但 App 无法消费事件
+- 修复：`onStartCommand` 中调用 `migrateOutOfFreezer()`，用 root 把自身进程从 `uid_<uid>/pid_<pid>` cgroup 迁移到 `uid_<uid>` 级 cgroup，MIUI 冻结动作针对 pid 子目录，迁移后找不到目标
+- 实测：打开 YouTube 后台运行 60 秒，sconfig 持续保持 9，线程无冻结痕迹
 
 ## 构建
 
