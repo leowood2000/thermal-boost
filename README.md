@@ -65,6 +65,14 @@ MIUI 的 `mi_thermald` 进程通过 inotify 监控 `/sys/devices/virtual/thermal
 - 修复：`onStartCommand` 中调用 `migrateOutOfFreezer()`，用 root 把自身进程从 `uid_<uid>/pid_<pid>` cgroup 迁移到 `uid_<uid>` 级 cgroup，MIUI 冻结动作针对 pid 子目录，迁移后找不到目标
 - 实测：打开 YouTube 后台运行 60 秒，sconfig 持续保持 9，线程无冻结痕迹
 
+### v1.1.4 — 逻辑 bug 修复 + 健壮性提升
+- **删除 800ms quiet window**：自己写 9 后 800ms 内的真正场景修改被忽略，直到 60s poll 才拉回；`readSconfig()==9` 天然不会死循环，quiet window 完全多余且有害
+- **FGS 启动顺序修正**：`migrateOutOfFreezer()` 移到 `startForeground()` 之后，避免 su/root 操作卡住导致 FGS 启动超时被系统杀
+- **cgroup 迁移验证**：增加返回码检查 + readback 验证（读 `/proc/pid/cgroup` 确认已离开 pid 子目录），不再假成功
+- **UI 异步化**：`toggle()`/`execRoot()`/`readSconfig()` 移到 `ExecutorService`，不再阻塞主线程
+- **UI 状态分离**：区分「场景 = ARVR」和「守卫运行中」，新增 guardText 显示守卫状态
+- **PID 精确 kill**：`startInotify` 时用 `pgrep` 记录 inotifyd PID，`stopGuard` 时 `kill PID` 而非 `pkill` 模糊匹配
+
 ## 构建
 
 需要 Android SDK build-tools 34 + JDK 17：
