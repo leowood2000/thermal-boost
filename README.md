@@ -42,7 +42,9 @@ MIUI 的 `mi_thermald` 进程通过 inotify 监控 `/sys/devices/virtual/thermal
 ## v1.1 改进
 
 - **场景守卫前台服务**：开启加速后，通过 root inotifyd 事件驱动监控 sconfig，场景被改走时自动拉回 ARVR(9)
+- **防冻结豁免**：自动把进程迁移到 uid 级 cgroup，规避 MIUI/HyperOS 后台进程冻结（freezer）导致守卫失效的问题
 - **省电设计**：inotify 事件驱动，无事件时 CPU 占用 0%；60s 低频轮询兜底
+- **进程健壮性**：exec 消除中间 shell 避免僵尸进程；关闭时 pkill 清理残留 inotifyd
 - **前台通知**：低优先级常驻通知，仅提示运行状态，无声音无振动
 - 同时对有线充电热控限流也有改善（ARVR 高温段限流比 Normal 更宽松）
 

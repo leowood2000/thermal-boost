@@ -72,6 +72,7 @@ public class SceneGuardService extends Service {
             return START_NOT_STICKY;
         }
         guardEnabled = true; // 服务启动/重建时始终启用守护（进程被杀后静态变量会重置）
+        migrateOutOfFreezer(); // 迁移到 uid 级 cgroup，避免 MIUI 冻结导致守卫失效
         boolean fgStarted = false;
         try {
             startForegroundCompat();
@@ -143,6 +144,36 @@ public class SceneGuardService extends Service {
         }, "scene-guard");
         watcherThread.setDaemon(true);
         watcherThread.start();
+    }
+
+    /**
+     * 把自身进程从 pid 级 cgroup 迁移到 uid 级 cgroup，避开 MIUI 的进程冻结机制。
+     *
+     * MIUI 通过给 /sys/fs/cgroup/uid_<uid>/pid_<pid>/cgroup.freeze 写 1 来冻结后台
+     * 进程，冻结后 App 所有线程（含 scene-guard）都无法执行，守卫失效。
+     * 迁移到 uid 级 cgroup 后，MIUI 的冻结动作（针对 pid 子目录）将找不到目标。
+     */
+    private void migrateOutOfFreezer() {
+        try {
+            int myPid = android.os.Process.myPid();
+            // 从 /proc/self/cgroup 解析 uid 目录名（如 uid_10479）
+            Process p = Runtime.getRuntime().exec(new String[]{"su", "-c",
+                    "cat /proc/" + myPid + "/cgroup | grep '^0::' | sed 's#^0::/##; s#/pid_.*##'"});
+            BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()));
+            String uidDir = br.readLine();
+            p.waitFor();
+            if (uidDir == null || uidDir.isEmpty() || !uidDir.startsWith("uid_")) {
+                Log.w(TAG, "migrate: cannot parse uid dir: " + uidDir);
+                return;
+            }
+            // 迁移自身 pid 到 uid 级 cgroup
+            Process m = Runtime.getRuntime().exec(new String[]{"su", "-c",
+                    "echo " + myPid + " > /sys/fs/cgroup/" + uidDir + "/cgroup.procs"});
+            m.waitFor();
+            Log.i(TAG, "migrated to " + uidDir);
+        } catch (Exception e) {
+            Log.w(TAG, "migrate failed", e);
+        }
     }
 
     private void stopGuard() {
