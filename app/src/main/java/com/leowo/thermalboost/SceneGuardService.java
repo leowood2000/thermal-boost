@@ -85,6 +85,11 @@ public class SceneGuardService extends Service {
             // 在 worker 线程中执行 root/cgroup 操作，不阻塞 onStartCommand
             new Thread(() -> {
                 migrateOutOfFreezer(); // 迁移到 uid 级 cgroup，避免 MIUI 冻结导致守卫失效
+                // 迁移期间服务可能已被关闭，需检查并回滚迁移
+                if (!running.get()) {
+                    migrateBackToFreezer();
+                    return;
+                }
                 startGuard();
             }, "guard-init").start();
         }
@@ -122,6 +127,7 @@ public class SceneGuardService extends Service {
     }
 
     private void startGuard() {
+        if (!running.get()) return; // 服务已关闭，不启动守卫
         stopGuard(); // 清理旧状态
         // 兜底轮询：60s 一次，仅在 inotify 事件完全丢失时兜底
         handler.postDelayed(pollTask, POLL_INTERVAL_MS);
