@@ -71,6 +71,7 @@ public class SceneGuardService extends Service {
             stopSelf();
             return START_NOT_STICKY;
         }
+        guardEnabled = true; // 服务启动/重建时始终启用守护（进程被杀后静态变量会重置）
         boolean fgStarted = false;
         try {
             startForegroundCompat();
@@ -146,6 +147,15 @@ public class SceneGuardService extends Service {
 
     private void stopGuard() {
         handler.removeCallbacksAndMessages(null);
+// 用 root 强制清理所有本 App 的 inotifyd 监听进程（避免 readLoop 退出后
+            // inotifyProc 被置 null 导致 destroy 落空的竞态残留）
+            // 注意：inotifyd 的命令行是 "inotifyd - <path> c"，事件类型 c 是独立参数，
+            // 因此匹配时不能带 ":c" 后缀
+            try {
+                Process pk = Runtime.getRuntime().exec(new String[]{"su", "-c",
+                        "pkill -f 'inotifyd - " + SCONFIG_PATH + "'"});
+                pk.waitFor();
+            } catch (Exception ignored) {}
         if (inotifyProc != null) {
             inotifyProc.destroy();
             inotifyProc = null;
@@ -163,8 +173,9 @@ public class SceneGuardService extends Service {
     private Process startInotify() {
         try {
             // 用 Runtime.exec 而非 ProcessBuilder，避免前台服务上下文中 ProcessBuilder 的权限问题
+            // 用 exec 让 su 的 shell 直接替换为 inotifyd，避免残留中间 shell/僵尸进程导致管道阻塞
             Process p = Runtime.getRuntime().exec(new String[]{"su", "-c",
-                    "inotifyd - " + SCONFIG_PATH + ":c 2>/dev/null"});
+                    "exec inotifyd - " + SCONFIG_PATH + ":c 2>/dev/null"});
             // 短暂探测：如果立刻退出说明 root 失败
             try {
                 Thread.sleep(300);
