@@ -79,6 +79,10 @@ MIUI 的 `mi_thermald` 进程通过 inotify 监控 `/sys/devices/virtual/thermal
 - **初始状态竞态**：`onCreate` 先禁用按钮，异步读取完成后才启用，防止读到错误初始状态误触 toggle
 - **root 写入失败检查**：`execRoot` 返回 `boolean`，开启时 root 失败不启动守护服务并提示用户
 
+### v1.1.6 — guard-init 线程竞态修复
+- 修复 `onStartCommand` 中 cgroup 迁移线程与 `onDestroy` 的竞态：迁移完成后若服务已被关闭，会回滚迁移并 return，不再对已停止的服务执行后续操作
+- `startGuard` 开头增加 `running` 检查，避免在服务已停止后仍启动 inotifyd 守卫
+
 ## 构建
 
 需要 Android SDK build-tools 34 + JDK 17：
