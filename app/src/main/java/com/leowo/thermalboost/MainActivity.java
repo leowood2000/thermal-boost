@@ -1,6 +1,9 @@
 package com.leowo.thermalboost;
 
 import android.app.Activity;
+import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.os.Build;
 import android.os.Bundle;
 import android.view.View;
 import android.widget.TextView;
@@ -20,25 +23,66 @@ public class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
+        requestNotificationPermission();
+
         boosted = readSconfig() == ARVR_SCENE;
         updateUI();
 
         findViewById(R.id.toggleBtn).setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                if (boosted) {
-                    execRoot("echo " + NORMAL_SCENE + " > " + SCONFIG_PATH);
-                } else {
-                    execRoot("echo " + ARVR_SCENE + " > " + SCONFIG_PATH);
-                }
-                try { Thread.sleep(300); } catch (InterruptedException e) {}
-                boosted = readSconfig() == ARVR_SCENE;
-                updateUI();
-                Toast.makeText(MainActivity.this,
-                    boosted ? "已开启加速充电 (ARVR)" : "已恢复默认充电",
-                    Toast.LENGTH_SHORT).show();
+                toggle();
             }
         });
+    }
+
+    /** Android 13+ 请求通知权限（前台服务通知需要） */
+    private void requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= 33) {
+            if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
+                    != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(new String[]{android.Manifest.permission.POST_NOTIFICATIONS}, 100);
+            }
+        }
+    }
+
+    private void toggle() {
+        if (boosted) {
+            // 关闭加速：先停服务（停止守护），再恢复 Normal
+            stopGuardService();
+            execRoot("echo " + NORMAL_SCENE + " > " + SCONFIG_PATH);
+        } else {
+            // 开启加速：先写 ARVR，再启动守护服务
+            execRoot("echo " + ARVR_SCENE + " > " + SCONFIG_PATH);
+            startGuardService();
+        }
+        try { Thread.sleep(300); } catch (InterruptedException e) {}
+        boosted = readSconfig() == ARVR_SCENE;
+        updateUI();
+        Toast.makeText(MainActivity.this,
+            boosted ? "已开启加速充电 (ARVR)，场景被改走将自动拉回" : "已恢复默认充电",
+            Toast.LENGTH_SHORT).show();
+    }
+
+    private void startGuardService() {
+        try {
+            Intent i = new Intent(this, SceneGuardService.class);
+            i.setAction(SceneGuardService.ACTION_START);
+            if (android.os.Build.VERSION.SDK_INT >= 26) {
+                startForegroundService(i);
+            } else {
+                startService(i);
+            }
+        } catch (Exception e) {
+            Toast.makeText(this, "守护服务启动失败: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void stopGuardService() {
+        try {
+            Intent i = new Intent(this, SceneGuardService.class);
+            stopService(i); // 直接停止服务（onDestroy 会清理）
+        } catch (Exception ignored) {}
     }
 
     private void updateUI() {

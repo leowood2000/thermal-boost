@@ -24,7 +24,9 @@ MIUI 的 `mi_thermald` 进程通过 inotify 监控 `/sys/devices/virtual/thermal
 3. 点击「切换」按钮 → 显示 **加速充电: ON** 即生效
 4. 再次点击 → 恢复默认充电
 
-> 注意：切换前台 App 时 scenariorecognition 服务可能覆盖 sconfig，需重新点开 App 切换。
+开启后，后台前台服务会自动守护 ARVR 场景：当其他 App（如相机、导航等）触发 scenariorecognition 覆盖 sconfig 时，会在 300ms 内自动拉回 ARVR(9)，无需手动干预。关闭加速时守护服务随之停止。
+
+> v1.0 需手动重新切换；v1.1 起支持自动场景守卫。
 
 ## 场景码映射
 
@@ -36,6 +38,13 @@ MIUI 的 `mi_thermald` 进程通过 inotify 监控 `/sys/devices/virtual/thermal
 | 6 | NOLIMITS | 16 | 4K |
 | 9 | **ARVR** | 18 | TGAME |
 | 10 | NAVIGATION | 20 | 原神 |
+
+## v1.1 改进
+
+- **场景守卫前台服务**：开启加速后，通过 root inotifyd 事件驱动监控 sconfig，场景被改走时自动拉回 ARVR(9)
+- **省电设计**：inotify 事件驱动，无事件时 CPU 占用 0%；60s 低频轮询兜底
+- **前台通知**：低优先级常驻通知，仅提示运行状态，无声音无振动
+- 同时对有线充电热控限流也有改善（ARVR 高温段限流比 Normal 更宽松）
 
 ## 构建
 
