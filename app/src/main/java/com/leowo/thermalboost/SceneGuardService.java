@@ -56,6 +56,7 @@ public class SceneGuardService extends Service {
     private Process inotifyProc;
     private volatile int inotifyPid = -1; // 记录 inotifyd 的 PID，用于精确 kill
     private Thread watcherThread;
+    private String originalCgroup = null; // 迁移前的原始 cgroup 路径，关闭时恢复
 
     @Override
     public void onCreate() {
@@ -94,6 +95,7 @@ public class SceneGuardService extends Service {
     public void onDestroy() {
         running.set(false);
         stopGuard();
+        migrateBackToFreezer(); // 恢复到原来的 pid 级 cgroup，让 MIUI freezer 重新管控
         super.onDestroy();
     }
 
@@ -166,8 +168,14 @@ public class SceneGuardService extends Service {
                 Log.w(TAG, "migrate: cannot parse uid dir: " + uidDir + " rc=" + rc);
                 return;
             }
-            // 迁移前记录当前 cgroup 路径
+            // 迁移前记录当前 cgroup 路径（含 pid 子目录），关闭时恢复
             String beforeCgroup = readCgroupPath(myPid);
+            // 仅当当前在 pid 子目录时才需要迁移
+            if (beforeCgroup == null || !beforeCgroup.contains("pid_")) {
+                Log.i(TAG, "already in uid-level cgroup, no migrate needed: " + beforeCgroup);
+                return;
+            }
+            originalCgroup = beforeCgroup;
             // 迁移自身 pid 到 uid 级 cgroup
             Process m = Runtime.getRuntime().exec(new String[]{"su", "-c",
                     "echo " + myPid + " > /sys/fs/cgroup/" + uidDir + "/cgroup.procs"});
@@ -185,6 +193,37 @@ public class SceneGuardService extends Service {
             }
         } catch (Exception e) {
             Log.w(TAG, "migrate failed", e);
+        }
+    }
+
+    /** 把进程迁回原来的 pid 级 cgroup，恢复 MIUI freezer 管控 */
+    private void migrateBackToFreezer() {
+        if (originalCgroup == null) return;
+        try {
+            int myPid = android.os.Process.myPid();
+            String cgroupPath = originalCgroup; // 如 /uid_10479/pid_12345
+            // 检查原 pid cgroup 目录是否仍存在
+            Process ck = Runtime.getRuntime().exec(new String[]{"su", "-c",
+                    "test -d /sys/fs/cgroup" + cgroupPath + " && echo ok"});
+            BufferedReader br = new BufferedReader(new InputStreamReader(ck.getInputStream()));
+            String exists = br.readLine();
+            ck.waitFor();
+            if ("ok".equals(exists)) {
+                Process m = Runtime.getRuntime().exec(new String[]{"su", "-c",
+                        "echo " + myPid + " > /sys/fs/cgroup" + cgroupPath + "/cgroup.procs"});
+                int mrc = m.waitFor();
+                if (mrc == 0) {
+                    Log.i(TAG, "migrated back to " + cgroupPath);
+                } else {
+                    Log.w(TAG, "migrate back failed rc=" + mrc);
+                }
+            } else {
+                // 原 pid cgroup 目录已不存在（进程可能已重建），无需恢复
+                Log.i(TAG, "original cgroup dir gone, skip restore: " + cgroupPath);
+            }
+            originalCgroup = null;
+        } catch (Exception e) {
+            Log.w(TAG, "migrate back failed", e);
         }
     }
 

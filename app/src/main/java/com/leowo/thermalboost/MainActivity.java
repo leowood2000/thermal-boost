@@ -31,12 +31,14 @@ public class MainActivity extends Activity {
 
         requestNotificationPermission();
 
-        // 异步读取初始状态，避免阻塞主线程
+        // 初始状态未知前禁用按钮，防止异步读取完成前误触
+        findViewById(R.id.toggleBtn).setEnabled(false);
         ioExecutor.execute(() -> {
             boolean isArvr = readSconfig() == ARVR_SCENE;
             uiHandler.post(() -> {
                 boosted = isArvr;
                 updateUI();
+                findViewById(R.id.toggleBtn).setEnabled(true);
             });
         });
 
@@ -60,7 +62,6 @@ public class MainActivity extends Activity {
 
     private void toggle() {
         final boolean wasBoosted = boosted;
-        // 立即禁用按钮，防止快速重复点击
         findViewById(R.id.toggleBtn).setEnabled(false);
         ioExecutor.execute(() -> {
             if (wasBoosted) {
@@ -69,10 +70,18 @@ public class MainActivity extends Activity {
                 stopGuardService();
                 execRoot("echo " + NORMAL_SCENE + " > " + SCONFIG_PATH);
             } else {
-                // 开启加速：先写 ARVR，再启用守护并启动服务
-                execRoot("echo " + ARVR_SCENE + " > " + SCONFIG_PATH);
-                SceneGuardService.guardEnabled = true;
-                startGuardService();
+                // 开启加速：先写 ARVR，写成功才启用守护并启动服务
+                if (execRoot("echo " + ARVR_SCENE + " > " + SCONFIG_PATH)) {
+                    SceneGuardService.guardEnabled = true;
+                    startGuardService();
+                } else {
+                    // root 写入失败，不启用守护
+                    uiHandler.post(() -> {
+                        Toast.makeText(MainActivity.this, "Root 写入失败，请检查 root 权限", Toast.LENGTH_LONG).show();
+                        findViewById(R.id.toggleBtn).setEnabled(true);
+                    });
+                    return;
+                }
             }
             try { Thread.sleep(300); } catch (InterruptedException e) {}
             final boolean isBoosted = readSconfig() == ARVR_SCENE;
@@ -110,7 +119,8 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
-        ioExecutor.shutdown();
+        uiHandler.removeCallbacksAndMessages(null);
+        ioExecutor.shutdownNow();
         super.onDestroy();
     }
 
@@ -118,6 +128,7 @@ public class MainActivity extends Activity {
         TextView tv = findViewById(R.id.statusText);
         TextView limitTv = findViewById(R.id.limitText);
         TextView guardTv = findViewById(R.id.guardText);
+        if (tv == null || limitTv == null || guardTv == null) return; // Activity 已销毁
         // 区分「场景 = ARVR」和「守卫运行中」
         boolean guardRunning = SceneGuardService.guardEnabled;
         if (boosted && guardRunning) {
@@ -132,13 +143,19 @@ public class MainActivity extends Activity {
         }
         guardTv.setText("守卫: " + (guardRunning ? "运行中" : "停止"));
         guardTv.setTextColor(guardRunning ? 0xFF00C853 : 0xFFAAAAAA);
-        // 异步读取 wireless_ctrl_limit
-        ioExecutor.execute(() -> {
-            final int limit = readWirelessCtrlLimit();
-            uiHandler.post(() -> {
-                limitTv.setText("wireless_ctrl_limit: " + limit + (limit == 0 ? " (不限流)" : " (限流中)"));
+        // 异步读取 wireless_ctrl_limit，检查 executor 是否已关闭
+        if (!ioExecutor.isShutdown()) {
+            ioExecutor.execute(() -> {
+                final int limit = readWirelessCtrlLimit();
+                if (!ioExecutor.isShutdown()) {
+                    uiHandler.post(() -> {
+                        if (!isFinishing()) {
+                            limitTv.setText("wireless_ctrl_limit: " + limit + (limit == 0 ? " (不限流)" : " (限流中)"));
+                        }
+                    });
+                }
             });
-        });
+        }
     }
 
     private int readSconfig() {
@@ -165,12 +182,13 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void execRoot(String cmd) {
+    private boolean execRoot(String cmd) {
         try {
             Process p = Runtime.getRuntime().exec(new String[]{"su", "-c", cmd});
-            p.waitFor();
+            return p.waitFor() == 0;
         } catch (Exception e) {
             uiHandler.post(() -> Toast.makeText(this, "Root 执行失败: " + e.getMessage(), Toast.LENGTH_LONG).show());
+            return false;
         }
     }
 }
