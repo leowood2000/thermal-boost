@@ -152,18 +152,18 @@ public class MainActivity extends Activity {
         super.onDestroy();
     }
 
-    /** 前台定时刷新：每 5 秒重读 sconfig + wireless_ctrl_limit，保持 UI 实时 */
+    /** 前台定时刷新：每 5 秒一次 su 合并读取 sconfig + wireless_ctrl_limit，保持 UI 实时 */
     private final Runnable refreshTask = new Runnable() {
         @Override
         public void run() {
             if (!isFinishing() && !ioExecutor.isShutdown()) {
                 ioExecutor.execute(() -> {
-                    final boolean isBoosted = readSconfig() == ARVR_SCENE;
+                    final int[] vals = readSconfigAndLimit();
                     if (!ioExecutor.isShutdown()) {
                         uiHandler.post(() -> {
                             if (isFinishing()) return;
-                            boosted = isBoosted;
-                            updateUI();
+                            boosted = (vals[0] == ARVR_SCENE);
+                            updateUI(vals[1]);
                         });
                     }
                 });
@@ -173,6 +173,10 @@ public class MainActivity extends Activity {
     };
 
     private void updateUI() {
+        updateUI(Integer.MIN_VALUE); // 无预读值，走异步读取
+    }
+
+    private void updateUI(int limit) {
         TextView tv = findViewById(R.id.statusText);
         TextView limitTv = findViewById(R.id.limitText);
         TextView guardTv = findViewById(R.id.guardText);
@@ -191,18 +195,38 @@ public class MainActivity extends Activity {
         }
         guardTv.setText("守卫: " + (guardRunning ? "运行中" : "停止"));
         guardTv.setTextColor(guardRunning ? 0xFF00C853 : 0xFFAAAAAA);
-        // 异步读取 wireless_ctrl_limit，检查 executor 是否已关闭
-        if (!ioExecutor.isShutdown()) {
+        if (limit != Integer.MIN_VALUE) {
+            // 已有预读值（来自定时刷新的合并读取），直接用
+            limitTv.setText("wireless_ctrl_limit: " + limit + (limit == 0 ? " (不限流)" : " (限流中)"));
+        } else if (!ioExecutor.isShutdown()) {
+            // 无预读值（toggle/onCreate），异步单独读取
             ioExecutor.execute(() -> {
-                final int limit = readWirelessCtrlLimit();
+                final int lim = readWirelessCtrlLimit();
                 if (!ioExecutor.isShutdown()) {
                     uiHandler.post(() -> {
                         if (!isFinishing()) {
-                            limitTv.setText("wireless_ctrl_limit: " + limit + (limit == 0 ? " (不限流)" : " (限流中)"));
+                            limitTv.setText("wireless_ctrl_limit: " + lim + (lim == 0 ? " (不限流)" : " (限流中)"));
                         }
                     });
                 }
             });
+        }
+    }
+
+    /** 一次 su 同时读取 sconfig 和 wireless_ctrl_limit，返回 int[2]{sconfig, limit} */
+    private int[] readSconfigAndLimit() {
+        try {
+            Process p = Runtime.getRuntime().exec(new String[]{"su", "-c",
+                    "cat " + SCONFIG_PATH + "; cat /sys/devices/platform/soc/soc:mca_charger_thermal/wireless_ctrl_limit"});
+            BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()));
+            String line1 = br.readLine();  // sconfig
+            String line2 = br.readLine();  // wireless_ctrl_limit
+            p.waitFor();
+            int s = line1 != null ? Integer.parseInt(line1.trim()) : -1;
+            int l = line2 != null ? Integer.parseInt(line2.trim()) : -1;
+            return new int[]{s, l};
+        } catch (Exception e) {
+            return new int[]{-1, -1};
         }
     }
 

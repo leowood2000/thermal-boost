@@ -90,6 +90,7 @@ MIUI 的 `mi_thermald` 进程通过 inotify 监控 `/sys/devices/virtual/thermal
 
 ### v1.1.8 — 前台定时刷新
 - App 在前台时每 5 秒自动重读 sconfig + wireless_ctrl_limit 并刷新 UI，充电过程中限流值实时更新
+- **合并读取优化**：一次 su 同时读取两个节点（cat sconfig; cat wireless_ctrl_limit），su 进程数从 24 次/分钟降到 12 次/分钟
 - onResume 启动定时、onPause 停止，切到后台不耗电
 
 ## 构建
