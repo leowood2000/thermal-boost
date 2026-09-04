@@ -93,6 +93,11 @@ MIUI 的 `mi_thermald` 进程通过 inotify 监控 `/sys/devices/virtual/thermal
 - **合并读取优化**：一次 su 同时读取两个节点（cat sconfig; cat wireless_ctrl_limit），su 进程数从 24 次/分钟降到 12 次/分钟
 - onResume 启动定时、onPause 停止，切到后台不耗电
 
+### v1.1.9 — toggle 三态逻辑
+- toggle() 判断条件从 oosted 改为 oosted && guardEnabled（真正的 ON）
+- 三种状态分别处理：ON→关闭（停守卫+写0）；OFF→开启（写9+启守卫）；ARVR但守卫未运行→直接启动守卫（不先写0再写9）
+- 修复 sconfig=9 残留状态被误判为 ON 的问题
+
 ## 构建
 
 需要 Android SDK build-tools 34 + JDK 17：

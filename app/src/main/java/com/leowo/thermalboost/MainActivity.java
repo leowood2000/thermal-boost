@@ -62,29 +62,30 @@ public class MainActivity extends Activity {
     }
 
     private void toggle() {
-        final boolean wasBoosted = boosted;
+        final boolean wasFullyOn = boosted && SceneGuardService.guardEnabled;
         findViewById(R.id.toggleBtn).setEnabled(false);
         ioExecutor.execute(() -> {
-            if (wasBoosted) {
-                // 关闭加速：先禁用守护（防止 inotify 拉回），再停服务，再恢复 Normal
+            if (wasFullyOn) {
+                // 真正 ON → 关闭：停守卫 + 写 0
                 SceneGuardService.guardEnabled = false;
                 stopGuardService();
                 execRoot("echo " + NORMAL_SCENE + " > " + SCONFIG_PATH);
             } else {
-                // 开启加速：先写 ARVR，写成功才启动守护服务
-                if (execRoot("echo " + ARVR_SCENE + " > " + SCONFIG_PATH)) {
+                // OFF 或 ARVR但守卫未运行 → 都进入完整 ON
+                // 已经是 9 就不必重复写
+                if (boosted || execRoot("echo " + ARVR_SCENE + " > " + SCONFIG_PATH)) {
                     if (startGuardService()) {
                         SceneGuardService.guardEnabled = true;
                     } else {
-                        // 服务启动失败，sconfig 已是 9 但没有守卫
+                        // 服务启动失败
                         uiHandler.post(() -> {
-                            Toast.makeText(MainActivity.this, "加速已开启但守护服务启动失败", Toast.LENGTH_LONG).show();
+                            Toast.makeText(MainActivity.this, "守护服务启动失败", Toast.LENGTH_LONG).show();
                             findViewById(R.id.toggleBtn).setEnabled(true);
                         });
                         return;
                     }
                 } else {
-                    // root 写入失败，不启用守护
+                    // root 写入失败
                     uiHandler.post(() -> {
                         Toast.makeText(MainActivity.this, "Root 写入失败，请检查 root 权限", Toast.LENGTH_LONG).show();
                         findViewById(R.id.toggleBtn).setEnabled(true);
