@@ -23,6 +23,7 @@ public class MainActivity extends Activity {
     private boolean boosted = false;
     private final ExecutorService ioExecutor = Executors.newSingleThreadExecutor();
     private final Handler uiHandler = new Handler(Looper.getMainLooper());
+    private static final int REFRESH_INTERVAL_MS = 5000;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -133,11 +134,43 @@ public class MainActivity extends Activity {
     }
 
     @Override
+    protected void onResume() {
+        super.onResume();
+        uiHandler.postDelayed(refreshTask, REFRESH_INTERVAL_MS);
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        uiHandler.removeCallbacks(refreshTask);
+    }
+
+    @Override
     protected void onDestroy() {
         uiHandler.removeCallbacksAndMessages(null);
         ioExecutor.shutdownNow();
         super.onDestroy();
     }
+
+    /** 前台定时刷新：每 5 秒重读 sconfig + wireless_ctrl_limit，保持 UI 实时 */
+    private final Runnable refreshTask = new Runnable() {
+        @Override
+        public void run() {
+            if (!isFinishing() && !ioExecutor.isShutdown()) {
+                ioExecutor.execute(() -> {
+                    final boolean isBoosted = readSconfig() == ARVR_SCENE;
+                    if (!ioExecutor.isShutdown()) {
+                        uiHandler.post(() -> {
+                            if (isFinishing()) return;
+                            boosted = isBoosted;
+                            updateUI();
+                        });
+                    }
+                });
+            }
+            uiHandler.postDelayed(this, REFRESH_INTERVAL_MS);
+        }
+    };
 
     private void updateUI() {
         TextView tv = findViewById(R.id.statusText);

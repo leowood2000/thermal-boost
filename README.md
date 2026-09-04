@@ -88,6 +88,10 @@ MIUI 的 `mi_thermald` 进程通过 inotify 监控 `/sys/devices/virtual/thermal
 - **onDestroy 清除 guardEnabled**：Service 非正常停止时也清除全局开关，防止 `guardEnabled` 残留为 true
 - **Toast 状态准确化**：根据 `boosted && guardEnabled` 组合显示三种提示（加速+守卫运行 / ARVR但守卫未运行 / 已恢复默认），修复关闭时 root 写 0 失败仍提示「场景被改走将自动拉回」的问题
 
+### v1.1.8 — 前台定时刷新
+- App 在前台时每 5 秒自动重读 sconfig + wireless_ctrl_limit 并刷新 UI，充电过程中限流值实时更新
+- onResume 启动定时、onPause 停止，切到后台不耗电
+
 ## 构建
 
 需要 Android SDK build-tools 34 + JDK 17：
