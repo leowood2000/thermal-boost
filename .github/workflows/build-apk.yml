@@ -73,8 +73,8 @@ jobs:
             --out build/apk/thermal-boost-v1.2-debug.apk \
             build/apk/thermal-boost-aligned.apk
           "$build_tools/apksigner" verify --verbose build/apk/thermal-boost-v1.2-debug.apk
-          "$build_tools/aapt" dump badging build/apk/thermal-boost-v1.2-debug.apk > build/apk/badging.txt
-          sed -n '1p' build/apk/badging.txt
+          test -s build/apk/thermal-boost-v1.2-debug.apk
+          ls -lh build/apk/thermal-boost-v1.2-debug.apk
 
       - name: Upload review APK
         uses: actions/upload-artifact@v4
