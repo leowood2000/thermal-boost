@@ -1,0 +1,85 @@
+name: Build APK
+
+on:
+  push:
+    branches:
+      - feat/wired-charging-mode
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Compile and package APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          build_tools="$sdk_root/build-tools/34.0.0"
+          android_jar="$sdk_root/platforms/android-34/android.jar"
+          for tool in aapt d8 zipalign apksigner; do
+            test -x "$build_tools/$tool" || { echo "Missing Android build tool: $build_tools/$tool" >&2; exit 1; }
+          done
+          test -f "$android_jar"
+
+          mkdir -p build/generated build/classes build/dex build/apk
+          "$build_tools/aapt" package -f -m \
+            -J build/generated \
+            -M app/src/main/AndroidManifest.xml \
+            -S app/src/main/res \
+            -I "$android_jar"
+
+          mapfile -d '' sources < <(find app/src/main/java build/generated -name '*.java' -print0)
+          javac -encoding UTF-8 -source 11 -target 11 \
+            -classpath "$android_jar" \
+            -d build/classes "${sources[@]}"
+
+          "$build_tools/aapt" package -f \
+            -M app/src/main/AndroidManifest.xml \
+            -S app/src/main/res \
+            -I "$android_jar" \
+            -F build/apk/thermal-boost-unsigned.apk
+
+          mapfile -d '' classes < <(find build/classes -name '*.class' -print0)
+          "$build_tools/d8" --lib "$android_jar" --min-api 26 \
+            --output build/dex "${classes[@]}"
+          (cd build/dex && zip -j -0 ../apk/thermal-boost-unsigned.apk ./*.dex)
+          "$build_tools/zipalign" -f 4 \
+            build/apk/thermal-boost-unsigned.apk \
+            build/apk/thermal-boost-aligned.apk
+
+          keytool -genkeypair -noprompt \
+            -keystore build/apk/ci-debug.keystore \
+            -storepass android -keypass android \
+            -alias androiddebugkey \
+            -dname 'CN=Android Debug,O=Android,C=US' \
+            -keyalg RSA -keysize 2048 -validity 10000
+          "$build_tools/apksigner" sign \
+            --ks build/apk/ci-debug.keystore \
+            --ks-key-alias androiddebugkey \
+            --ks-pass pass:android --key-pass pass:android \
+            --out build/apk/thermal-boost-v1.2-debug.apk \
+            build/apk/thermal-boost-aligned.apk
+          "$build_tools/apksigner" verify --verbose build/apk/thermal-boost-v1.2-debug.apk
+          "$build_tools/aapt" dump badging build/apk/thermal-boost-v1.2-debug.apk > build/apk/badging.txt
+          sed -n '1p' build/apk/badging.txt
+
+      - name: Upload review APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: thermal-boost-v1.2-debug
+          path: build/apk/thermal-boost-v1.2-debug.apk
+          if-no-files-found: error
+          retention-days: 14

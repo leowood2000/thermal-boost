@@ -5,12 +5,16 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
+import android.os.BatteryManager;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.os.PowerManager;
 import android.util.Log;
 import java.io.BufferedReader;
 import java.io.FileInputStream;
@@ -21,7 +25,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * 场景守卫前台服务。
  *
  * 职责：监控 /sys/devices/virtual/thermal/thermal_message/sconfig，
- * 一旦被其他应用改走（!= 9），立即以 root 写回 ARVR(9)。
+ * 根据所选模式守护 sconfig：无线模式使用 ARVR(9)，有线模式仅在安全条件满足时使用 hp-normal(500)。
  *
  * 省电设计：
  *  1. 事件驱动：用 root 起的 inotifyd 监听 sconfig 的 c(modified) 事件，
@@ -36,50 +40,109 @@ public class SceneGuardService extends Service {
     private static final String TAG = "SceneGuard";
     public static final String ACTION_START = "com.leowo.thermalboost.START";
     public static final String ACTION_STOP = "com.leowo.thermalboost.STOP";
+    public static final String EXTRA_SCENE = "target_scene";
+    public static final String PREFS_NAME = "thermal_boost";
+    public static final String PREF_SCENE = "selected_scene";
+    private static final String PREF_WIRED_OWNED = "wired_scene_owned";
+    private static final String PREF_WIRELESS_OWNED = "wireless_scene_owned";
     private static final String CHANNEL_ID = "thermal_boost_guard";
     private static final int NOTIF_ID = 1;
 
     public static final String SCONFIG_PATH = "/sys/devices/virtual/thermal/thermal_message/sconfig";
+    public static final int NORMAL_SCENE = 0;
     public static final int ARVR_SCENE = 9;
+    public static final int WIRED_SCENE = 500;
 
-    /**
-     * 全局守护开关。MainActivity 关闭加速时先置 false，
-     * 确保 stopService 的异步 onDestroy 执行前，守卫线程不会把 sconfig 拉回。
-     */
+    /** guardEnabled 表示当前模式已选择并由服务守护；wired 模式可能因条件不满足而暂不生效。 */
     public static volatile boolean guardEnabled = false;
+    public static volatile int targetScene = NORMAL_SCENE;
     private static final int POLL_INTERVAL_MS = 60_000;
     private static final int RETRY_COUNT = 5;
     private static final int RETRY_DELAY_MS = 200;
 
     private final AtomicBoolean running = new AtomicBoolean(false);
+    private final AtomicBoolean modeCheckRunning = new AtomicBoolean(false);
+    private final AtomicBoolean modeCheckAgain = new AtomicBoolean(false);
+    private final Object modeLock = new Object();
     private Handler handler;
     private Process inotifyProc;
     private volatile int inotifyPid = -1; // 记录 inotifyd 的 PID，用于精确 kill
     private Thread watcherThread;
     private String originalCgroup = null; // 迁移前的原始 cgroup 路径，关闭时恢复
+    private volatile boolean wiredSceneOwned;
+    private volatile boolean wirelessSceneOwned;
+    private boolean stateReceiverRegistered;
+
+    private final BroadcastReceiver stateReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (intent != null && (Intent.ACTION_BATTERY_CHANGED.equals(intent.getAction())
+                    || Intent.ACTION_SCREEN_ON.equals(intent.getAction())
+                    || Intent.ACTION_SCREEN_OFF.equals(intent.getAction()))) {
+                scheduleModeCheck();
+            }
+        }
+    };
 
     @Override
     public void onCreate() {
         super.onCreate();
         handler = new Handler(Looper.getMainLooper());
+        android.content.SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        targetScene = prefs.getInt(PREF_SCENE, NORMAL_SCENE);
+        wiredSceneOwned = prefs.getBoolean(PREF_WIRED_OWNED, false);
+        wirelessSceneOwned = prefs.getBoolean(PREF_WIRELESS_OWNED, false);
+        registerStateReceiver();
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         String action = intent != null ? intent.getAction() : null;
         if (ACTION_STOP.equals(action)) {
-            stopSelf();
+            int previousScene;
+            synchronized (modeLock) {
+                previousScene = targetScene;
+                targetScene = NORMAL_SCENE;
+                guardEnabled = false;
+                saveSelectedScene(NORMAL_SCENE);
+            }
+            startForegroundCompat();
+            final int stopStartId = startId;
+            new Thread(() -> {
+                restoreOwnedScene(previousScene);
+                // Do not tear down a newer mode request that arrived during restore.
+                stopSelf(stopStartId);
+            }, "guard-stop").start();
             return START_NOT_STICKY;
         }
-        guardEnabled = true; // 服务启动/重建时始终启用守护（进程被杀后静态变量会重置）
+        int requestedScene = intent != null && intent.hasExtra(EXTRA_SCENE)
+                ? intent.getIntExtra(EXTRA_SCENE, NORMAL_SCENE)
+                : getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getInt(PREF_SCENE, NORMAL_SCENE);
+        if (!isSupportedScene(requestedScene)) {
+            targetScene = NORMAL_SCENE;
+            guardEnabled = false;
+            saveSelectedScene(NORMAL_SCENE);
+            startForegroundCompat();
+            stopSelf(startId);
+            return START_NOT_STICKY;
+        }
+        synchronized (modeLock) {
+            // An upgrade from the old ARVR-only version can switch before the new
+            // guard has had a chance to persist that the active 9 was app-managed.
+            if (requestedScene == WIRED_SCENE && guardEnabled && running.get()
+                    && targetScene == ARVR_SCENE
+                    && readSconfig() == ARVR_SCENE) {
+                setWirelessSceneOwned(true);
+            }
+            targetScene = requestedScene;
+            guardEnabled = true;
+            saveSelectedScene(requestedScene);
+        }
         // 先立即拿到 FGS 身份，避免 startForegroundService() 超时被系统杀
-        boolean fgStarted = false;
         try {
             startForegroundCompat();
-            fgStarted = true;
         } catch (Exception e) {
-            // 后台重建时可能不允许启动前台服务，降级为普通服务继续监控
-            Log.w(TAG, "startForeground failed, degrade to normal service", e);
+            Log.w(TAG, "startForeground failed", e);
         }
         if (!running.getAndSet(true)) {
             // 在 worker 线程中执行 root/cgroup 操作，不阻塞 onStartCommand
@@ -91,8 +154,11 @@ public class SceneGuardService extends Service {
                     return;
                 }
                 startGuard();
+                // 初次启动时先确保 running=true 后再执行；onStartCommand 中的检查可能抢跑。
+                scheduleModeCheck();
             }, "guard-init").start();
         }
+        scheduleModeCheck();
         return START_STICKY; // 被系统杀后尝试重建，重建即重新监控
     }
 
@@ -101,30 +167,254 @@ public class SceneGuardService extends Service {
         running.set(false);
         guardEnabled = false; // 确保非正常停止时也清除全局开关
         stopGuard();
+        restoreOwnedWiredSceneOnDestroy();
         migrateBackToFreezer(); // 恢复到原来的 pid 级 cgroup，让 MIUI freezer 重新管控
+        if (stateReceiverRegistered) {
+            try { unregisterReceiver(stateReceiver); } catch (Exception ignored) {}
+            stateReceiverRegistered = false;
+        }
         super.onDestroy();
     }
 
     private void startForegroundCompat() {
-        NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            NotificationChannel ch = new NotificationChannel(CHANNEL_ID, "充电加速", NotificationManager.IMPORTANCE_MIN);
-            ch.setShowBadge(false);
-            ch.setSound(null, null);
-            nm.createNotificationChannel(ch);
+        startForeground(NOTIF_ID, buildNotification());
+    }
+
+    private void registerStateReceiver() {
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(Intent.ACTION_BATTERY_CHANGED);
+        filter.addAction(Intent.ACTION_SCREEN_ON);
+        filter.addAction(Intent.ACTION_SCREEN_OFF);
+        try {
+            if (Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(stateReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+            } else {
+                registerReceiver(stateReceiver, filter);
+            }
+            stateReceiverRegistered = true;
+        } catch (Exception e) {
+            Log.w(TAG, "state receiver registration failed", e);
+        }
+    }
+
+    private boolean isSupportedScene(int scene) {
+        return scene == ARVR_SCENE || scene == WIRED_SCENE;
+    }
+
+    private void saveSelectedScene(int scene) {
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putInt(PREF_SCENE, scene).apply();
+    }
+
+    private boolean setWiredSceneOwned(boolean owned) {
+        boolean saved = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putBoolean(PREF_WIRED_OWNED, owned).commit();
+        if (saved) wiredSceneOwned = owned;
+        else Log.w(TAG, "could not persist wired scene ownership=" + owned);
+        return saved;
+    }
+
+    private boolean setWirelessSceneOwned(boolean owned) {
+        boolean saved = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putBoolean(PREF_WIRELESS_OWNED, owned).commit();
+        if (saved) wirelessSceneOwned = owned;
+        else Log.w(TAG, "could not persist wireless scene ownership=" + owned);
+        return saved;
+    }
+
+    private String notificationText() {
+        int scene = targetScene;
+        if (scene == WIRED_SCENE) {
+            return isWiredEligible() ? "正在守护有线 hp-normal (500)" : "有线模式已选择，等待有线供电和亮屏";
+        }
+        return scene == ARVR_SCENE ? "正在守护无线 ARVR (9)" : "场景守护已停止";
+    }
+
+    /** Wired hp-normal is specific to miro and only eligible with USB/AC power and an interactive display. */
+    private boolean isWiredEligible() {
+        if (!"miro".equalsIgnoreCase(Build.DEVICE)) return false;
+        Intent battery = registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+        if (battery == null) return false;
+        int plugged = battery.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0);
+        if (plugged != BatteryManager.BATTERY_PLUGGED_USB
+                && plugged != BatteryManager.BATTERY_PLUGGED_AC) return false;
+        PowerManager powerManager = (PowerManager) getSystemService(Context.POWER_SERVICE);
+        return powerManager != null && powerManager.isInteractive();
+    }
+
+    private void scheduleModeCheck() {
+        if (!guardEnabled) return;
+        if (!modeCheckRunning.compareAndSet(false, true)) {
+            modeCheckAgain.set(true);
+            return;
+        }
+        new Thread(() -> {
+            try {
+                do {
+                    modeCheckAgain.set(false);
+                    enforceSelectedScene();
+                } while (modeCheckAgain.get());
+            } finally {
+                modeCheckRunning.set(false);
+                if (modeCheckAgain.get()) scheduleModeCheck();
+            }
+        }, "scene-enforce").start();
+    }
+
+    /** Serialize all scene writes with mode changes; wired mode never writes outside its eligibility gate. */
+    private void enforceSelectedScene() {
+        synchronized (modeLock) {
+            if (!running.get() || !guardEnabled) return;
+            int scene = targetScene;
+            int current = readSconfig();
+            if (scene == ARVR_SCENE) {
+                if (current != ARVR_SCENE) {
+                    boolean wrote = writeSconfig(ARVR_SCENE);
+                    int afterWrite = readSconfig();
+                    if (afterWrite == ARVR_SCENE) {
+                        if (wrote) Log.i(TAG, "restored wireless ARVR(9)");
+                        // The explicit wireless mode owns 9 even if it was already active.
+                        setWirelessSceneOwned(true);
+                        setWiredSceneOwned(false);
+                    } else {
+                        if (afterWrite != ARVR_SCENE) setWirelessSceneOwned(false);
+                        if (afterWrite != WIRED_SCENE) setWiredSceneOwned(false);
+                    }
+                } else {
+                    setWirelessSceneOwned(true);
+                    setWiredSceneOwned(false);
+                }
+            } else if (scene == WIRED_SCENE) {
+                if (isWiredEligible()) {
+                    if (current != WIRED_SCENE && !applyWiredScene()) {
+                        // If the previous app-owned ARVR could not be replaced, do not leave it active.
+                        clearOwnedScenesWhileWiredWaits();
+                    }
+                    if (!isWiredEligible()) clearOwnedScenesWhileWiredWaits();
+                } else {
+                    // A deliberate ARVR -> wired mode change also removes our old ARVR scene.
+                    clearOwnedScenesWhileWiredWaits();
+                }
+            }
+        }
+        updateForegroundNotification();
+    }
+
+    /** The only path that writes hp-normal. Ownership is durable before the gated write. */
+    private boolean applyWiredScene() {
+        if (!isWiredEligible() || readSconfig() == WIRED_SCENE) return false;
+        if (!setWiredSceneOwned(true)) return false;
+        // Do not claim an already-active OEM 500 if it appeared before our write.
+        if (readSconfig() == WIRED_SCENE) {
+            setWiredSceneOwned(false);
+            return false;
+        }
+        // This is the final eligibility check immediately before the sysfs write.
+        if (!isWiredEligible()) {
+            setWiredSceneOwned(false);
+            return false;
+        }
+
+        boolean wrote = writeSconfig(WIRED_SCENE);
+        int current = readSconfig();
+        if (!wrote || current != WIRED_SCENE) {
+            setWiredSceneOwned(false);
+            return false;
+        }
+        if (!isWiredEligible()) {
+            // If eligibility disappeared while the sysfs write was running, undo our scene now.
+            if (writeSconfig(NORMAL_SCENE)) {
+                setWiredSceneOwned(false);
+                setWirelessSceneOwned(false);
+            }
+            return false;
+        }
+        setWirelessSceneOwned(false);
+        return wrote || current == WIRED_SCENE;
+    }
+
+    /** Clear only scenes this service previously wrote; preserve unrelated OEM-selected scenes. */
+    private void clearOwnedScenesWhileWiredWaits() {
+        int current = readSconfig();
+        if (current == WIRED_SCENE && wiredSceneOwned) {
+            if (writeSconfig(NORMAL_SCENE)) {
+                setWiredSceneOwned(false);
+                setWirelessSceneOwned(false);
+            }
+        } else if (current == ARVR_SCENE && wirelessSceneOwned) {
+            if (writeSconfig(NORMAL_SCENE)) {
+                setWirelessSceneOwned(false);
+                setWiredSceneOwned(false);
+            }
+        } else {
+            if (current != WIRED_SCENE) setWiredSceneOwned(false);
+            if (current != ARVR_SCENE) setWirelessSceneOwned(false);
+        }
+    }
+
+    /** onDestroy is the final synchronous safety net when the service is gracefully removed. */
+    private void restoreOwnedWiredSceneOnDestroy() {
+        synchronized (modeLock) {
+            int current = readSconfig();
+            if (current == WIRED_SCENE && wiredSceneOwned) {
+                if (writeSconfig(NORMAL_SCENE)) {
+                    setWiredSceneOwned(false);
+                    setWirelessSceneOwned(false);
+                }
+            } else if (current != WIRED_SCENE && wiredSceneOwned) {
+                setWiredSceneOwned(false);
+            }
+        }
+    }
+
+    private void restoreOwnedScene(int previousScene) {
+        synchronized (modeLock) {
+            // A newer START may have superseded this asynchronous stop request.
+            if (guardEnabled || targetScene != NORMAL_SCENE) return;
+            int current = readSconfig();
+            if (current == WIRED_SCENE && wiredSceneOwned) {
+                if (writeSconfig(NORMAL_SCENE)) {
+                    setWiredSceneOwned(false);
+                    setWirelessSceneOwned(false);
+                }
+            } else if (current == ARVR_SCENE
+                    && (previousScene == ARVR_SCENE || wirelessSceneOwned)) {
+                // Preserve legacy wireless-off behavior and clear app-owned ARVR transitions.
+                if (writeSconfig(NORMAL_SCENE)) {
+                    setWirelessSceneOwned(false);
+                    setWiredSceneOwned(false);
+                }
+            } else {
+                if (current != WIRED_SCENE) setWiredSceneOwned(false);
+                if (current != ARVR_SCENE) setWirelessSceneOwned(false);
+            }
+        }
+    }
+
+    private void updateForegroundNotification() {
+        if (!guardEnabled) return;
+        NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        if (manager != null) manager.notify(NOTIF_ID, buildNotification());
+    }
+
+    private Notification buildNotification() {
+        NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && manager != null) {
+            NotificationChannel channel = new NotificationChannel(CHANNEL_ID, "充电加速", NotificationManager.IMPORTANCE_MIN);
+            channel.setShowBadge(false);
+            channel.setSound(null, null);
+            manager.createNotificationChannel(channel);
         }
         Intent i = new Intent(this, MainActivity.class);
         PendingIntent pi = PendingIntent.getActivity(this, 0, i,
                 PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
-        Notification n = new Notification.Builder(this, CHANNEL_ID)
+        return new Notification.Builder(this, CHANNEL_ID)
                 .setContentTitle("充电加速运行中")
-                .setContentText("正在守护 ARVR 充电场景")
+                .setContentText(notificationText())
                 .setSmallIcon(android.R.drawable.ic_lock_power_off)
                 .setContentIntent(pi)
                 .setOngoing(true)
                 .setPriority(Notification.PRIORITY_MIN)
                 .build();
-        startForeground(NOTIF_ID, n);
     }
 
     private void startGuard() {
@@ -324,33 +614,34 @@ public class SceneGuardService extends Service {
     }
 
     private void handleEvent() {
-        if (!running.get()) return;
-        if (!guardEnabled) return; // 全局开关已关，不再拉回
-        // 被改成非 9 → 拉回（带重试）
-        // 自己写 9 会再次触发 inotify 事件，但下次 readSconfig() == 9 就 return，天然不会死循环
+        if (!running.get() || !guardEnabled) return;
         for (int i = 0; i < RETRY_COUNT; i++) {
-            if (!running.get()) return;
-            if (readSconfig() != ARVR_SCENE) {
-                if (writeSconfig(ARVR_SCENE)) {
-                    Log.i(TAG, "scene hijacked -> restored to ARVR(9)");
-                }
-            } else {
-                return; // 值已经是对的
-            }
+            if (!running.get() || !guardEnabled) return;
+            enforceSelectedScene();
+            if (!needsEnforcement()) return;
             try { Thread.sleep(RETRY_DELAY_MS); } catch (InterruptedException e) { return; }
+        }
+    }
+
+    private boolean needsEnforcement() {
+        synchronized (modeLock) {
+            if (!guardEnabled) return false;
+            int current = readSconfig();
+            if (targetScene == ARVR_SCENE) return current != ARVR_SCENE;
+            if (targetScene == WIRED_SCENE) {
+                if (isWiredEligible()) return current != WIRED_SCENE;
+                return (current == WIRED_SCENE && wiredSceneOwned)
+                        || (current == ARVR_SCENE && wirelessSceneOwned);
+            }
+            return false;
         }
     }
 
     private final Runnable pollTask = new Runnable() {
         @Override
         public void run() {
-        if (!running.get()) return;
-        if (!guardEnabled) return; // 全局开关已关，不再拉回
-        if (readSconfig() != ARVR_SCENE) {
-            if (writeSconfig(ARVR_SCENE)) {
-                Log.i(TAG, "poll restore ARVR");
-                }
-            }
+            if (!running.get()) return;
+            scheduleModeCheck();
             handler.postDelayed(this, POLL_INTERVAL_MS);
         }
     };

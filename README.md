@@ -1,15 +1,18 @@
 # Thermal Boost
 
-K80 Pro (miro) 无线充电加速开关。通过切换 MIUI 热控场景为 ARVR（sconfig=9），使无线充电在中低温段不限流，充电功率提升 1.5–3 倍。
+Redmi K80 Pro (miro) 热控场景切换器，使用 Xiaomi 自带的 `mi_thermald` 场景，不关闭热控或改写充电电流节点。
+
+- **无线充电**：选择 ARVR（`sconfig=9`），沿用原有无线加速与场景守护。
+- **有线充电**：选择 hp-normal（`sconfig=500`），依据热控场景分析中的候选场景实现；仅在 miro、USB/AC 有线供电且屏幕亮起时应用。
 
 ## 原理
 
-MIUI 的 `mi_thermald` 进程通过 inotify 监控 `/sys/devices/virtual/thermal/thermal_message/sconfig` 节点获取当前场景码。本 App 通过 root 写入 `sconfig=9`（ARVR 场景），mi_thermald 即刻加载 ARVR 热控配置：
+MIUI 的 `mi_thermald` 进程通过 inotify 监控 `/sys/devices/virtual/thermal/thermal_message/sconfig` 节点获取当前场景码。本 App 通过 root 写入 `sconfig` 场景码，随后由 `mi_thermald` 加载对应热控配置：
 
 - **Normal 场景**：虚拟温度 ~35°C 开始限流（wireless_ctrl_limit=3）
-- **ARVR 场景**：38.5°C 以下完全不限流（wireless_ctrl_limit=0）
+- **ARVR 场景**：38.5°C 以下无线热控不限流（wireless_ctrl_limit=0）
 
-实测充电电流从 ~300mA 提升到 ~900mA（电池端）。
+文档 4.5 将 hp-normal（500）列为有线充电值得实测的候选场景，主要优势在约 33–40°C；它不保证实际充电电流一定提高，实际值仍受协议曲线、热控等级和电池 PID 控制。
 
 ## 要求
 
@@ -19,12 +22,13 @@ MIUI 的 `mi_thermald` 进程通过 inotify 监控 `/sys/devices/virtual/thermal
 
 ## 使用
 
-1. 安装 APK
-2. 打开「充电加速」
-3. 点击「切换」按钮 → 显示 **加速充电: ON** 即生效
-4. 再次点击 → 恢复默认充电
+1. 安装 APK 并打开「充电加速」。
+2. 无线充电时选择 **无线 ARVR (9)**；有线充电时选择 **有线 hp-normal (500)**。
+3. 两种模式互斥。再次点击当前模式即可关闭。
 
-开启后，后台前台服务会自动守护 ARVR 场景：当其他 App（如相机、导航等）触发 scenariorecognition 覆盖 sconfig 时，会在 300ms 内自动拉回 ARVR(9)，无需手动干预。关闭加速时守护服务随之停止。
+hp-normal 仅允许在设备代号为 `miro`、电源类型为 USB/AC 且屏幕亮起时应用。拔掉有线充电或熄屏后，守护服务不再强制 500；若当前仍是 App 写入的 500，则恢复默认场景 0。选择有线模式会清理由 App 设置且仍有效的旧 ARVR 场景；条件不满足时保留待命状态，满足后再应用 500。服务正常销毁时也会清理由 App 管理的 500。无线充电请使用 ARVR：hp-normal 的无线侧会更早限流。
+
+守护服务使用 inotify 监控场景变化，并以 60 秒轮询兜底。ARVR 模式保持原有行为；hp-normal 模式只在上述条件成立时拉回 500，不覆盖其他系统场景。
 
 > v1.0 需手动重新切换；v1.1 起支持自动场景守卫。
 
@@ -38,6 +42,13 @@ MIUI 的 `mi_thermald` 进程通过 inotify 监控 `/sys/devices/virtual/thermal
 | 6 | NOLIMITS | 16 | 4K |
 | 9 | **ARVR** | 18 | TGAME |
 | 10 | NAVIGATION | 20 | 原神 |
+| 500 | **hp-normal**（仅 K80 Pro 有线亮屏） | — | — |
+
+## v1.2 改进
+
+- 新增独立的有线 hp-normal (500) 控制；与无线 ARVR (9) 互斥。
+- 仅在 Redmi K80 Pro (miro)、USB/AC 供电、屏幕交互时写入 500；条件失效或服务正常销毁时只清理由本 App 管理的 500。
+- 前台状态和通知显示所选模式与当前场景；保留 OEM 热控和充电策略。
 
 ## v1.1 改进
 

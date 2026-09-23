@@ -5,40 +5,54 @@
     android:gravity="center"
     android:orientation="vertical"
     android:background="#1A1A2E"
-    android:padding="32dp">
+    android:padding="24dp">
 
     <TextView
         android:id="@+id/statusText"
-        android:layout_width="wrap_content"
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:textSize="28sp"
+        android:gravity="center"
+        android:textSize="22sp"
         android:textStyle="bold"
-        android:layout_marginBottom="4dp" />
-
-    <TextView
-        android:id="@+id/guardText"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:textSize="14sp"
-        android:textColor="#AAAAAAAA"
         android:layout_marginBottom="8dp" />
 
     <TextView
-        android:id="@+id/limitText"
-        android:layout_width="wrap_content"
+        android:id="@+id/guardText"
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:textSize="16sp"
+        android:gravity="center"
+        android:textSize="14sp"
         android:textColor="#AAAAAAAA"
-        android:layout_marginBottom="48dp" />
+        android:layout_marginBottom="12dp" />
+
+    <TextView
+        android:id="@+id/limitText"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center"
+        android:textSize="13sp"
+        android:textColor="#FFB0BEC5"
+        android:layout_marginBottom="24dp" />
 
     <Button
         android:id="@+id/toggleBtn"
-        android:layout_width="220dp"
-        android:layout_height="64dp"
-        android:text="切换"
-        android:textSize="20sp"
+        android:layout_width="match_parent"
+        android:layout_height="60dp"
+        android:text="开启无线充电加速 (ARVR)"
+        android:textSize="17sp"
         android:textStyle="bold"
         android:backgroundTint="#0F3460"
+        android:textColor="#FFFFFF" />
+
+    <Button
+        android:id="@+id/wiredToggleBtn"
+        android:layout_width="match_parent"
+        android:layout_height="60dp"
+        android:layout_marginTop="12dp"
+        android:text="开启有线充电加速 (hp-normal)"
+        android:textSize="17sp"
+        android:textStyle="bold"
+        android:backgroundTint="#6A3D00"
         android:textColor="#FFFFFF" />
 
 </LinearLayout>

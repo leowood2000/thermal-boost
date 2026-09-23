@@ -2,28 +2,34 @@ package com.leowo.thermalboost;
 
 import android.app.Activity;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.PackageManager;
+import android.os.BatteryManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.PowerManager;
 import android.view.View;
 import android.widget.TextView;
 import android.widget.Toast;
-import java.io.*;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public class MainActivity extends Activity {
 
     private static final String SCONFIG_PATH = "/sys/devices/virtual/thermal/thermal_message/sconfig";
-    private static final int ARVR_SCENE = 9;
     private static final int NORMAL_SCENE = 0;
+    private static final int ARVR_SCENE = 9;
+    private static final int WIRED_SCENE = 500;
+    private static final int REFRESH_INTERVAL_MS = 5000;
 
-    private boolean boosted = false;
+    private volatile int actualScene = -1;
+    private volatile int selectedScene = NORMAL_SCENE;
     private final ExecutorService ioExecutor = Executors.newSingleThreadExecutor();
     private final Handler uiHandler = new Handler(Looper.getMainLooper());
-    private static final int REFRESH_INTERVAL_MS = 5000;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -31,107 +37,134 @@ public class MainActivity extends Activity {
         setContentView(R.layout.activity_main);
 
         requestNotificationPermission();
+        selectedScene = readSelectedScene();
+        setButtonsEnabled(false);
+        findViewById(R.id.toggleBtn).setOnClickListener(v -> toggleScene(ARVR_SCENE));
+        findViewById(R.id.wiredToggleBtn).setOnClickListener(v -> toggleScene(WIRED_SCENE));
 
-        // 初始状态未知前禁用按钮，防止异步读取完成前误触
-        findViewById(R.id.toggleBtn).setEnabled(false);
         ioExecutor.execute(() -> {
-            boolean isArvr = readSconfig() == ARVR_SCENE;
+            final int[] values = readSconfigAndLimit();
             uiHandler.post(() -> {
-                boosted = isArvr;
-                updateUI();
-                findViewById(R.id.toggleBtn).setEnabled(true);
+                actualScene = values[0];
+                syncSelectedScene();
+                updateUI(values[1]);
+                setButtonsEnabled(true);
             });
-        });
-
-        findViewById(R.id.toggleBtn).setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                toggle();
-            }
         });
     }
 
     /** Android 13+ 请求通知权限（前台服务通知需要） */
     private void requestNotificationPermission() {
-        if (Build.VERSION.SDK_INT >= 33) {
-            if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
-                    != PackageManager.PERMISSION_GRANTED) {
-                requestPermissions(new String[]{android.Manifest.permission.POST_NOTIFICATIONS}, 100);
-            }
+        if (Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{android.Manifest.permission.POST_NOTIFICATIONS}, 100);
         }
     }
 
-    private void toggle() {
-        final boolean wasFullyOn = boosted && SceneGuardService.guardEnabled;
-        findViewById(R.id.toggleBtn).setEnabled(false);
+    private void toggleScene(int requestedScene) {
+        syncSelectedScene();
+        if (selectedScene != requestedScene && requestedScene == WIRED_SCENE
+                && !"miro".equalsIgnoreCase(Build.DEVICE)) {
+            Toast.makeText(this, wiredIneligibleReason(), Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        setButtonsEnabled(false);
+        // If Android restored the saved selection but the service is not alive,
+        // tapping the selected mode should bring its guard back instead of disabling it.
+        final boolean turnOff = selectedScene == requestedScene && SceneGuardService.guardEnabled;
         ioExecutor.execute(() -> {
-            if (wasFullyOn) {
-                // 真正 ON → 关闭：停守卫 + 写 0
-                SceneGuardService.guardEnabled = false;
-                stopGuardService();
-                execRoot("echo " + NORMAL_SCENE + " > " + SCONFIG_PATH);
+            if (turnOff) {
+                requestServiceStop();
+            } else if (!requestServiceStart(requestedScene)) {
+                showToast("守护服务启动失败", Toast.LENGTH_LONG);
             } else {
-                // OFF 或 ARVR但守卫未运行 → 都进入完整 ON
-                // 已经是 9 就不必重复写
-                if (boosted || execRoot("echo " + ARVR_SCENE + " > " + SCONFIG_PATH)) {
-                    if (startGuardService()) {
-                        SceneGuardService.guardEnabled = true;
-                    } else {
-                        // 服务启动失败
-                        uiHandler.post(() -> {
-                            Toast.makeText(MainActivity.this, "守护服务启动失败", Toast.LENGTH_LONG).show();
-                            findViewById(R.id.toggleBtn).setEnabled(true);
-                        });
-                        return;
-                    }
-                } else {
-                    // root 写入失败
-                    uiHandler.post(() -> {
-                        Toast.makeText(MainActivity.this, "Root 写入失败，请检查 root 权限", Toast.LENGTH_LONG).show();
-                        findViewById(R.id.toggleBtn).setEnabled(true);
-                    });
-                    return;
-                }
+                String name = requestedScene == WIRED_SCENE ? "有线 hp-normal (500)" : "无线 ARVR (9)";
+                String suffix = requestedScene == WIRED_SCENE ? "，符合条件时自动应用" : "";
+                showToast("已选择" + name + "模式" + suffix, Toast.LENGTH_SHORT);
             }
-            try { Thread.sleep(300); } catch (InterruptedException e) {}
-            final boolean isBoosted = readSconfig() == ARVR_SCENE;
+
+            try { Thread.sleep(350); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            final int[] values = readSconfigAndLimit();
             uiHandler.post(() -> {
-                boosted = isBoosted;
-                updateUI();
-                findViewById(R.id.toggleBtn).setEnabled(true);
-                // 根据 boost + guardEnabled 组合显示准确提示
-                if (boosted && SceneGuardService.guardEnabled) {
-                    Toast.makeText(MainActivity.this, "已开启加速充电 (ARVR)，场景被改走将自动拉回", Toast.LENGTH_SHORT).show();
-                } else if (boosted && !SceneGuardService.guardEnabled) {
-                    Toast.makeText(MainActivity.this, "当前仍为 ARVR，但守卫未运行", Toast.LENGTH_SHORT).show();
-                } else {
-                    Toast.makeText(MainActivity.this, "已恢复默认充电", Toast.LENGTH_SHORT).show();
-                }
+                actualScene = values[0];
+                syncSelectedScene();
+                updateUI(values[1]);
+                setButtonsEnabled(true);
             });
         });
     }
 
-    private boolean startGuardService() {
+    private boolean requestServiceStart(int scene) {
         try {
-            Intent i = new Intent(this, SceneGuardService.class);
-            i.setAction(SceneGuardService.ACTION_START);
-            if (android.os.Build.VERSION.SDK_INT >= 26) {
-                startForegroundService(i);
-            } else {
-                startService(i);
-            }
+            Intent intent = new Intent(this, SceneGuardService.class);
+            intent.setAction(SceneGuardService.ACTION_START);
+            intent.putExtra(SceneGuardService.EXTRA_SCENE, scene);
+            if (Build.VERSION.SDK_INT >= 26) startForegroundService(intent);
+            else startService(intent);
             return true;
         } catch (Exception e) {
-            uiHandler.post(() -> Toast.makeText(this, "守护服务启动失败: " + e.getMessage(), Toast.LENGTH_LONG).show());
             return false;
         }
     }
 
-    private void stopGuardService() {
+    private void requestServiceStop() {
         try {
-            Intent i = new Intent(this, SceneGuardService.class);
-            stopService(i); // 直接停止服务（onDestroy 会清理）
-        } catch (Exception ignored) {}
+            Intent intent = new Intent(this, SceneGuardService.class);
+            intent.setAction(SceneGuardService.ACTION_STOP);
+            if (Build.VERSION.SDK_INT >= 26) startForegroundService(intent);
+            else startService(intent);
+        } catch (Exception e) {
+            showToast("无法停止场景守护服务: " + e.getMessage(), Toast.LENGTH_LONG);
+        }
+    }
+
+    private int readSelectedScene() {
+        return getSharedPreferences(SceneGuardService.PREFS_NAME, MODE_PRIVATE)
+                .getInt(SceneGuardService.PREF_SCENE, NORMAL_SCENE);
+    }
+
+    private void syncSelectedScene() {
+        if (SceneGuardService.guardEnabled) {
+            selectedScene = SceneGuardService.targetScene;
+        } else {
+            selectedScene = readSelectedScene();
+        }
+    }
+
+    private boolean isScreenInteractive() {
+        PowerManager powerManager = (PowerManager) getSystemService(POWER_SERVICE);
+        return powerManager != null && powerManager.isInteractive();
+    }
+
+    private String wiredIneligibleReason() {
+        if (!"miro".equalsIgnoreCase(Build.DEVICE)) {
+            return "hp-normal (500) 仅针对 Redmi K80 Pro (miro) 实测，不在此设备启用";
+        }
+        if (!isWiredCharging()) {
+            return "有线模式仅在 USB/AC 有线充电时可开启；无线充电请使用 ARVR 模式";
+        }
+        return "有线模式仅在屏幕亮起时可开启";
+    }
+
+    private boolean isWiredCharging() {
+        Intent battery = registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+        if (battery == null) return false;
+        int plugged = battery.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0);
+        return plugged == BatteryManager.BATTERY_PLUGGED_USB
+                || plugged == BatteryManager.BATTERY_PLUGGED_AC;
+    }
+
+    private void setButtonsEnabled(boolean enabled) {
+        View wireless = findViewById(R.id.toggleBtn);
+        View wired = findViewById(R.id.wiredToggleBtn);
+        if (wireless != null) wireless.setEnabled(enabled);
+        if (wired != null) wired.setEnabled(enabled);
+    }
+
+    private void showToast(String message, int duration) {
+        uiHandler.post(() -> Toast.makeText(MainActivity.this, message, duration).show());
     }
 
     @Override
@@ -153,18 +186,19 @@ public class MainActivity extends Activity {
         super.onDestroy();
     }
 
-    /** 前台定时刷新：每 5 秒一次 su 合并读取 sconfig + wireless_ctrl_limit，保持 UI 实时 */
+    /** 前台每 5 秒刷新当前 sconfig 与无线限流值。 */
     private final Runnable refreshTask = new Runnable() {
         @Override
         public void run() {
             if (!isFinishing() && !ioExecutor.isShutdown()) {
                 ioExecutor.execute(() -> {
-                    final int[] vals = readSconfigAndLimit();
+                    final int[] values = readSconfigAndLimit();
                     if (!ioExecutor.isShutdown()) {
                         uiHandler.post(() -> {
                             if (isFinishing()) return;
-                            boosted = (vals[0] == ARVR_SCENE);
-                            updateUI(vals[1]);
+                            actualScene = values[0];
+                            syncSelectedScene();
+                            updateUI(values[1]);
                         });
                     }
                 });
@@ -174,39 +208,56 @@ public class MainActivity extends Activity {
     };
 
     private void updateUI() {
-        updateUI(Integer.MIN_VALUE); // 无预读值，走异步读取
+        updateUI(Integer.MIN_VALUE);
     }
 
-    private void updateUI(int limit) {
-        TextView tv = findViewById(R.id.statusText);
-        TextView limitTv = findViewById(R.id.limitText);
+    private void updateUI(int wirelessLimit) {
+        TextView statusTv = findViewById(R.id.statusText);
         TextView guardTv = findViewById(R.id.guardText);
-        if (tv == null || limitTv == null || guardTv == null) return; // Activity 已销毁
-        // 区分「场景 = ARVR」和「守卫运行中」
-        boolean guardRunning = SceneGuardService.guardEnabled;
-        if (boosted && guardRunning) {
-            tv.setText("加速充电: ON");
-            tv.setTextColor(0xFF00C853);
-        } else if (boosted && !guardRunning) {
-            tv.setText("场景: ARVR (守卫未运行)");
-            tv.setTextColor(0xFFFF9800);
+        TextView limitTv = findViewById(R.id.limitText);
+        TextView wirelessBtn = findViewById(R.id.toggleBtn);
+        TextView wiredBtn = findViewById(R.id.wiredToggleBtn);
+        if (statusTv == null || guardTv == null || limitTv == null || wirelessBtn == null || wiredBtn == null) return;
+
+        statusTv.setText("当前热控场景：" + sceneName(actualScene));
+        statusTv.setTextColor(actualScene == selectedScene && selectedScene != NORMAL_SCENE
+                ? 0xFF00C853 : actualScene < 0 ? 0xFFFF9800 : 0xFFAAAAAA);
+
+        boolean serviceActive = SceneGuardService.guardEnabled;
+        if (selectedScene == ARVR_SCENE) {
+            guardTv.setText(serviceActive ? "已选择无线 ARVR (9) · 场景守护运行中"
+                    : "已选择无线 ARVR (9) · 守护服务未运行");
+            guardTv.setTextColor(serviceActive ? 0xFF00C853 : 0xFFFF9800);
+        } else if (selectedScene == WIRED_SCENE) {
+            String state;
+            if (!"miro".equalsIgnoreCase(Build.DEVICE)) state = "设备不支持";
+            else if (!isWiredCharging()) state = "等待 USB/AC 有线供电";
+            else if (!isScreenInteractive()) state = "等待屏幕亮起";
+            else if (actualScene == WIRED_SCENE) state = "hp-normal 已生效";
+            else state = "等待场景加载";
+            guardTv.setText((serviceActive ? "已选择有线 hp-normal (500) · " : "有线 hp-normal (500) 已选择 · ") + state);
+            guardTv.setTextColor(serviceActive && actualScene == WIRED_SCENE ? 0xFF00C853 : 0xFFFF9800);
         } else {
-            tv.setText("加速充电: OFF");
-            tv.setTextColor(0xFFE53935);
+            guardTv.setText("场景守护：停止");
+            guardTv.setTextColor(0xFFAAAAAA);
         }
-        guardTv.setText("守卫: " + (guardRunning ? "运行中" : "停止"));
-        guardTv.setTextColor(guardRunning ? 0xFF00C853 : 0xFFAAAAAA);
-        if (limit != Integer.MIN_VALUE) {
-            // 已有预读值（来自定时刷新的合并读取），直接用
-            limitTv.setText("wireless_ctrl_limit: " + limit + (limit == 0 ? " (不限流)" : " (限流中)"));
+
+        wirelessBtn.setText(selectedScene == ARVR_SCENE ? "关闭无线充电加速 (ARVR)" : "开启无线充电加速 (ARVR)");
+        wiredBtn.setText(selectedScene == WIRED_SCENE ? "关闭有线充电加速 (hp-normal)" : "开启有线充电加速 (hp-normal)");
+
+        if (selectedScene == WIRED_SCENE || actualScene == WIRED_SCENE) {
+            limitTv.setText("hp-normal 仅限 miro 有线亮屏场景；无线充电在该场景下更早限流");
+        } else if (wirelessLimit != Integer.MIN_VALUE) {
+            limitTv.setText("wireless_ctrl_limit: " + wirelessLimit
+                    + (wirelessLimit == 0 ? " (不限流)" : wirelessLimit < 0 ? " (读取失败)" : " (限流中)"));
         } else if (!ioExecutor.isShutdown()) {
-            // 无预读值（toggle/onCreate），异步单独读取
             ioExecutor.execute(() -> {
-                final int lim = readWirelessCtrlLimit();
+                final int value = readWirelessCtrlLimit();
                 if (!ioExecutor.isShutdown()) {
                     uiHandler.post(() -> {
-                        if (!isFinishing()) {
-                            limitTv.setText("wireless_ctrl_limit: " + lim + (lim == 0 ? " (不限流)" : " (限流中)"));
+                        if (!isFinishing() && selectedScene != WIRED_SCENE && actualScene != WIRED_SCENE) {
+                            limitTv.setText("wireless_ctrl_limit: " + value
+                                    + (value == 0 ? " (不限流)" : value < 0 ? " (读取失败)" : " (限流中)"));
                         }
                     });
                 }
@@ -214,54 +265,40 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** 一次 su 同时读取 sconfig 和 wireless_ctrl_limit，返回 int[2]{sconfig, limit} */
+    private String sceneName(int scene) {
+        if (scene == NORMAL_SCENE) return "默认 (0)";
+        if (scene == ARVR_SCENE) return "无线 ARVR (9)";
+        if (scene == WIRED_SCENE) return "有线 hp-normal (500)";
+        return scene < 0 ? "读取失败" : String.valueOf(scene);
+    }
+
+    /** 一次 su 同时读取 sconfig 和无线限流节点，返回 int[2]{sconfig, limit} */
     private int[] readSconfigAndLimit() {
         try {
             Process p = Runtime.getRuntime().exec(new String[]{"su", "-c",
                     "cat " + SCONFIG_PATH + "; cat /sys/devices/platform/soc/soc:mca_charger_thermal/wireless_ctrl_limit"});
             BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()));
-            String line1 = br.readLine();  // sconfig
-            String line2 = br.readLine();  // wireless_ctrl_limit
+            String line1 = br.readLine();
+            String line2 = br.readLine();
             p.waitFor();
-            int s = line1 != null ? Integer.parseInt(line1.trim()) : -1;
-            int l = line2 != null ? Integer.parseInt(line2.trim()) : -1;
-            return new int[]{s, l};
+            int scene = line1 != null ? Integer.parseInt(line1.trim()) : -1;
+            int limit = line2 != null ? Integer.parseInt(line2.trim()) : -1;
+            return new int[]{scene, limit};
         } catch (Exception e) {
             return new int[]{-1, -1};
         }
     }
 
-    private int readSconfig() {
-        try {
-            Process p = Runtime.getRuntime().exec(new String[]{"su", "-c", "cat " + SCONFIG_PATH});
-            BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()));
-            String line = br.readLine();
-            p.waitFor();
-            return line != null ? Integer.parseInt(line.trim()) : -1;
-        } catch (Exception e) {
-            return -1;
-        }
-    }
-
     private int readWirelessCtrlLimit() {
         try {
-            Process p = Runtime.getRuntime().exec(new String[]{"su", "-c", "cat /sys/devices/platform/soc/soc:mca_charger_thermal/wireless_ctrl_limit"});
+            Process p = Runtime.getRuntime().exec(new String[]{"su", "-c",
+                    "cat /sys/devices/platform/soc/soc:mca_charger_thermal/wireless_ctrl_limit"});
             BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()));
             String line = br.readLine();
             p.waitFor();
             return line != null ? Integer.parseInt(line.trim()) : -1;
         } catch (Exception e) {
             return -1;
-        }
-    }
-
-    private boolean execRoot(String cmd) {
-        try {
-            Process p = Runtime.getRuntime().exec(new String[]{"su", "-c", cmd});
-            return p.waitFor() == 0;
-        } catch (Exception e) {
-            uiHandler.post(() -> Toast.makeText(this, "Root 执行失败: " + e.getMessage(), Toast.LENGTH_LONG).show());
-            return false;
         }
     }
 }
