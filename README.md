@@ -2,6 +2,12 @@
 
 Redmi K80 Pro (miro) 热控场景切换器，使用 Xiaomi 自带的 `mi_thermald` 场景，不关闭热控或改写充电电流节点。
 
+## 下载
+
+[下载 v1.2 APK 和查看发布说明](https://github.com/leowood2000/thermal-boost/releases/tag/v1.2)
+
+> v1.2 APK 使用本次 GitHub Actions 构建时生成的临时调试签名。升级安装会因签名不同而失败；需先卸载旧版再安装，卸载会清除 App 本地数据。后续要支持原位升级，需配置可复用的发布签名密钥。
+
 - **无线充电**：选择 ARVR（`sconfig=9`），沿用原有无线加速与场景守护。
 - **有线充电**：选择 hp-normal（`sconfig=500`），依据热控场景分析中的候选场景实现；仅在 miro、USB/AC 有线供电且屏幕亮起时应用。
 
@@ -105,21 +111,15 @@ hp-normal 仅允许在设备代号为 `miro`、电源类型为 USB/AC 且屏幕�
 - onResume 启动定时、onPause 停止，切到后台不耗电
 
 ### v1.1.9 — toggle 三态逻辑
-- toggle() 判断条件从 oosted 改为 oosted && guardEnabled（真正的 ON）
+- toggle() 判断条件从 `boosted` 改为 `boosted && guardEnabled`（真正的 ON）
 - 三种状态分别处理：ON→关闭（停守卫+写0）；OFF→开启（写9+启守卫）；ARVR但守卫未运行→直接启动守卫（不先写0再写9）
 - 修复 sconfig=9 残留状态被误判为 ON 的问题
 
 ## 构建
 
-需要 Android SDK build-tools 34 + JDK 17：
+仓库通过 GitHub Actions 的 [Build APK 工作流](https://github.com/leowood2000/thermal-boost/actions/workflows/build-apk.yml) 构建，使用 JDK 17、Android SDK Platform 34 和 Build Tools 34.0.0。推送到 `feat/wired-charging-mode` 会自动构建；也可以在 Actions 页面手动运行 `Build APK`。
 
-```
-aapt package -f -m -J gen -M AndroidManifest.xml -S res -I android.jar
-javac -encoding UTF-8 -source 11 -target 11 -cp android.jar -d bin/classes src/.../*.java gen/.../R.java
-aapt package -f -M AndroidManifest.xml -S res -I android.jar -F bin/resources.apk
-java -cp d8.jar com.android.tools.r8.D8 --output bin --min-api 26 bin/classes/**/*.class
-# 将 classes.dex 加入 resources.apk，zipalign + apksigner 签名
-```
+构建成功后，`thermal-boost-v1.2-debug` artifact 保留 14 天；正式下载请使用上面的 GitHub Release。CI 每次构建会生成新的临时调试密钥，因此该 APK 适合全新安装或测试，不适合连续版本原位升级。
 
 ## License
 
